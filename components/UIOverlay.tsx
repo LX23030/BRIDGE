@@ -1,6 +1,8 @@
-import React from 'react';
-import { RotateCcw, ArrowRight } from 'lucide-react';
+
+import React, { useState } from 'react';
+import { RotateCcw, ArrowRight, Volume2, VolumeX, Heart } from 'lucide-react';
 import { LevelData } from '../types';
+import { audioService } from '../services/audioService';
 
 interface UIOverlayProps {
   level: LevelData;
@@ -10,6 +12,8 @@ interface UIOverlayProps {
   onNextLevel: () => void;
   inkLeft: number;
   maxInk: number;
+  playerHp: number;
+  playerMaxHp: number;
 }
 
 const UIOverlay: React.FC<UIOverlayProps> = ({ 
@@ -19,8 +23,17 @@ const UIOverlay: React.FC<UIOverlayProps> = ({
   onReset, 
   onNextLevel,
   inkLeft,
-  maxInk
+  maxInk,
+  playerHp,
+  playerMaxHp
 }) => {
+  const [isMuted, setIsMuted] = useState(false);
+
+  const handleToggleMute = () => {
+      const muted = audioService.toggleMute();
+      setIsMuted(muted);
+  };
+
   return (
     <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-6">
       
@@ -31,14 +44,51 @@ const UIOverlay: React.FC<UIOverlayProps> = ({
             <p className="text-sm text-slate-500 mt-1">关卡 {level.id}: {level.name}</p>
         </div>
         
-        <button 
-          onClick={onReset}
-          className="pointer-events-auto bg-white text-slate-600 p-2 rounded-full shadow-md hover:bg-slate-50 transition-transform hover:scale-110"
-          title="重置关卡"
-        >
-          <RotateCcw size={20} />
-        </button>
+        <div className="flex gap-2">
+            <button 
+              onClick={handleToggleMute}
+              className="pointer-events-auto bg-white text-slate-600 p-2 rounded-full shadow-md hover:bg-slate-50 transition-transform hover:scale-110"
+              title={isMuted ? "Unmute Music" : "Mute Music"}
+            >
+              {isMuted ? <VolumeX size={20} /> : <Volume2 size={20} />}
+            </button>
+            <button 
+              onClick={onReset}
+              className="pointer-events-auto bg-white text-slate-600 p-2 rounded-full shadow-md hover:bg-slate-50 transition-transform hover:scale-110"
+              title="重置关卡"
+            >
+              <RotateCcw size={20} />
+            </button>
+        </div>
       </div>
+
+      {/* Boss Health Bar */}
+      {level.boss && !showNarrative && (
+         <div className="absolute top-6 left-1/2 -translate-x-1/2 w-96 max-w-[80vw]">
+             <div className="flex justify-between text-xs text-red-800 mb-1 font-bold uppercase tracking-widest">
+                 <span>核心 (THE CORE)</span>
+             </div>
+             <div className="h-4 w-full bg-slate-900 rounded-full overflow-hidden border-2 border-slate-700">
+                 <div className="h-full bg-red-600 animate-pulse w-full"></div>
+             </div>
+             <p className="text-center text-[10px] text-red-500 mt-1">将同行者安置在安全区，使用能量球攻击核心！</p>
+         </div>
+      )}
+
+      {/* Player HP (Only show if MaxHP > 1, mainly for Boss Level) */}
+      {!showNarrative && (playerMaxHp > 1 || level.boss) && (
+          <div className="absolute top-20 right-6 flex flex-col items-end">
+              <div className="flex flex-wrap justify-end gap-1 max-w-[200px]">
+                  {Array.from({ length: playerMaxHp }).map((_, i) => (
+                      <Heart 
+                        key={i} 
+                        size={16} 
+                        className={`${i < playerHp ? 'fill-red-500 text-red-500' : 'fill-slate-200 text-slate-300'}`}
+                      />
+                  ))}
+              </div>
+          </div>
+      )}
 
       {/* Ink Meter */}
       {!showNarrative && (

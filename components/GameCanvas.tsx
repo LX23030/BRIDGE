@@ -1,6 +1,7 @@
 
 import React, { useEffect, useRef, useCallback } from 'react';
-import { GameState, LevelData, Entity, Platform, BridgeSegment, Vector2, Particle, Crate, Monster, Button, Zone } from '../types';
+import { GameState, LevelData, Entity, Platform, BridgeSegment, Vector2, Particle, Crate, Monster, Button, Zone, Boss, Projectile, Spawner } from '../types';
+import { audioService } from '../services/audioService';
 
 interface GameCanvasProps {
   gameState: GameState;
@@ -9,19 +10,21 @@ interface GameCanvasProps {
   onGameOver: () => void;
   inkLeft: number;
   setInkLeft: (val: number) => void;
+  setPlayerHp: (val: number) => void;
 }
 
 // --- Physics Constants ---
 const GRAVITY = 0.5;
-const GUIDE_SPEED = 3; 
-const JUMP_FORCE = -12;
-const FRICTION = 0.8;
+const GUIDE_SPEED = 2.2; 
+const JUMP_FORCE = -11;
+const FRICTION = 0.75;
 const TETHER_LENGTH = 70; 
 const RECONNECT_DIST = 100; // Max distance to reconnect
 const TETHER_STRENGTH = 0.05;
 const COMPANION_DRAG = 0.9;
 const COMPANION_WEIGHT = 0.8;
-const CRATE_FRICTION = 0.7;
+const WOOD_FRICTION = 0.7;
+const BOMB_FRICTION = 0.99; // Very slippery/rolling
 
 const GameCanvas: React.FC<GameCanvasProps> = ({ 
   gameState, 
@@ -29,7 +32,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
   onLevelComplete,
   onGameOver,
   inkLeft,
-  setInkLeft
+  setInkLeft,
+  setPlayerHp
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<number | null>(null);
@@ -41,8 +45,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
   // Game State Logic
   const physicsRef = useRef({
-    guide: { pos: {x:0, y:0}, vel: {x:0, y:0}, width: 30, height: 30, isGrounded: false, color: '#60a5fa' } as Entity,
-    companion: { pos: {x:0, y:0}, vel: {x:0, y:0}, width: 30, height: 30, isGrounded: false, color: '#ef4444' } as Entity,
+    guide: { pos: {x:0, y:0}, vel: {x:0, y:0}, width: 30, height: 30, isGrounded: false, color: '#60a5fa', hp: 5, maxHp: 5, invulnerableTimer: 0 } as Entity & { hp?: number, maxHp?: number, invulnerableTimer?: number },
+    companion: { pos: {x:0, y:0}, vel: {x:0, y:0}, width: 30, height: 30, isGrounded: false, color: '#ef4444', hp: 5, maxHp: 5, invulnerableTimer: 0 } as Entity & { hp?: number, maxHp?: number, invulnerableTimer?: number },
     bridges: [] as BridgeSegment[],
     particles: [] as Particle[],
     // Local state copies for physics simulation
@@ -51,6 +55,9 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     buttons: [] as Button[],
     monsters: [] as Monster[],
     noInkZones: [] as Zone[],
+    boss: null as Boss | null,
+    projectiles: [] as Projectile[],
+    spawners: [] as Spawner[],
     bridgeCount: 0,
     lastMousePos: null as Vector2 | null,
     cameraX: 0,
@@ -58,15 +65,37 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     isTethered: true 
   });
 
+  // Start BGM on mount
+  useEffect(() => {
+    // We can't start BGM immediately due to autoplay policy, 
+    // but audioService.resume() is called on input interactions which will unblock it.
+    audioService.startBGM();
+    return () => {
+      audioService.stopBGM();
+    };
+  }, []);
+
   // Init Level
   useEffect(() => {
     const p = physicsRef.current;
     p.guide.pos = { ...currentLevel.startPos };
     p.guide.vel = { x: 0, y: 0 };
+    
+    // Set HP based on level config (default 5, or custom like 15)
+    const startingHp = currentLevel.playerMaxHp || 5;
+    p.guide.hp = startingHp; 
+    p.guide.maxHp = startingHp;
+    p.guide.invulnerableTimer = 0;
+    setPlayerHp(startingHp); // Sync UI
+    
     p.companion.pos = { ...currentLevel.companionPos };
     p.companion.vel = { x: 0, y: 0 };
+    p.companion.hp = 5;
+    p.companion.maxHp = 5;
+
     p.bridges = [];
     p.particles = [];
+    p.projectiles = [];
     
     // Deep clone level data so we can mutate it (e.g. moving platforms, button states)
     p.platforms = JSON.parse(JSON.stringify(currentLevel.platforms));
@@ -74,9 +103,15 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     p.buttons = JSON.parse(JSON.stringify(currentLevel.buttons || []));
     p.monsters = JSON.parse(JSON.stringify(currentLevel.monsters || []));
     p.noInkZones = JSON.parse(JSON.stringify(currentLevel.noInkZones || []));
+    p.boss = currentLevel.boss ? JSON.parse(JSON.stringify(currentLevel.boss)) : null;
+    p.spawners = JSON.parse(JSON.stringify(currentLevel.spawners || []));
 
     p.bridgeCount = 0;
     p.cameraX = 0;
+    // Set initial camera for auto-scroll levels to align with start
+    if (currentLevel.autoScrollSpeed) {
+        p.cameraX = 0;
+    }
     p.time = 0;
     p.isTethered = true; // Reset tether on new level
   }, [currentLevel, gameState]);
@@ -103,6 +138,9 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       // Vertical collision
       if (entity.vel.y > 0 && entity.pos.y < plat.y) {
         // Landed on top
+        // Play landing sound if impact was heavy enough
+        if (entity.vel.y > 5) audioService.playLand();
+
         entity.pos.y = plat.y - entity.height;
         entity.vel.y = 0;
         entity.isGrounded = true;
@@ -137,14 +175,15 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       }
     } else {
       // Horizontal collision
-      // Determine push direction based on relative centers
-      const diff = (entity.pos.x + entity.width/2) - (plat.x + plat.width/2);
+      // Improved snapping logic: check relative center position
+      const entCenter = entity.pos.x + entity.width/2;
+      const platCenter = plat.x + plat.width/2;
       
-      if (diff > 0) {
-          // Entity is to the right of the platform center -> Push Right
+      if (entCenter > platCenter) {
+          // Entity is to the right -> Push Right
           entity.pos.x = plat.x + plat.width;
       } else {
-          // Entity is to the left of the platform center -> Push Left
+          // Entity is to the left -> Push Left
           entity.pos.x = plat.x - entity.width;
       }
       entity.vel.x = 0;
@@ -161,11 +200,17 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     const maxX = Math.max(bridge.p1.x, bridge.p2.x);
 
     if (feetX >= minX - 5 && feetX <= maxX + 5) {
-      const slope = (bridge.p2.y - bridge.p1.y) / (bridge.p2.x - bridge.p1.x);
+      const dx = bridge.p2.x - bridge.p1.x;
+      const dy = bridge.p2.y - bridge.p1.y;
+      
+      // Prevent division by zero, though minimal impact here
+      if (Math.abs(dx) < 0.01) return false; 
+
+      const slope = dy / dx;
       const lineY = bridge.p1.y + slope * (feetX - bridge.p1.x);
 
       if (feetY >= lineY - 8 && feetY <= lineY + 15) { // Slight tolerance
-        return { y: lineY };
+        return { y: lineY, slope, angle: Math.atan2(dy, dx) };
       }
     }
     return false;
@@ -178,15 +223,45 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       entity.isGrounded = false;
   };
 
+  const takeDamage = (ent: any) => {
+      if (ent.invulnerableTimer > 0) return;
+      
+      if (currentLevel.boss || currentLevel.playerMaxHp) {
+          // HP System
+          ent.hp--;
+          ent.invulnerableTimer = 60; // 1s invul
+          audioService.playPlayerHit();
+          
+          if (ent === physicsRef.current.guide) {
+              setPlayerHp(ent.hp); // Update UI
+          }
+
+          if (ent.hp <= 0) {
+              audioService.playGameOver();
+              onGameOver();
+          }
+      } else {
+          // Normal level: Instant Kill
+          audioService.playGameOver();
+          onGameOver();
+      }
+  };
+
   const updateEntityCollisions = (entity: Entity | Crate, isPlayer: boolean) => {
     const p = physicsRef.current;
     
+    // Update invulnerability
+    if (isPlayer && (entity as any).invulnerableTimer > 0) {
+        (entity as any).invulnerableTimer--;
+    }
+
     // Platform Collisions
     for (const plat of p.platforms) {
       if (checkRectCollide(entity, plat)) {
         if (plat.type === 'hazard' && isPlayer) {
-           // Crates don't die, just players
-           if (gameState === GameState.PLAYING) onGameOver();
+           // Fall hazard is always instant death
+           audioService.playGameOver();
+           onGameOver();
            return;
         }
         if (plat.type === 'ground' || plat.type === 'goal' || plat.type === 'gate') {
@@ -199,15 +274,27 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     for (const bridge of p.bridges) {
       const collision = checkBridgeCollide(entity, bridge);
       if (collision) {
+        if (entity.vel.y > 5) audioService.playLand();
         entity.pos.y = collision.y - entity.height;
         entity.vel.y = 0;
         entity.isGrounded = true;
-        entity.vel.x *= 0.9;
+        
+        // Special logic for bombs rolling on bridges
+        if ((entity as Crate).type === 'bomb') {
+            // Apply slope physics
+            const gravitySlide = Math.sin(collision.angle) * GRAVITY * 2;
+            entity.vel.x += gravitySlide;
+            entity.vel.x *= 0.98; // Very low friction on lines
+        } else {
+            // Normal entity friction
+            entity.vel.x *= 0.9;
+        }
       }
     }
 
     // Screen Floor Kill
     if (entity.pos.y > 2000 && isPlayer) {
+       audioService.playGameOver();
        onGameOver();
     }
   };
@@ -233,10 +320,10 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         }
         
         // Check collision with players
-        if (checkRectCollide(p.guide, {x: m.pos.x, y: m.pos.y, width: m.width, height: m.height}) ||
-            checkRectCollide(p.companion, {x: m.pos.x, y: m.pos.y, width: m.width, height: m.height})) {
-            onGameOver();
+        if (checkRectCollide(p.guide, {x: m.pos.x, y: m.pos.y, width: m.width, height: m.height})) {
+            takeDamage(p.guide);
         }
+        // Companion is safe from monsters in current design request
      });
   };
 
@@ -282,6 +369,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
             }
         } else if (overlapY < overlapX && pusher.vel.y > 0 && pusher.pos.y < crate.pos.y) {
              // Landing on crate
+             if (pusher.vel.y > 5) audioService.playLand();
              pusher.pos.y = crate.pos.y - pusher.height;
              pusher.vel.y = 0;
              pusher.isGrounded = true;
@@ -294,7 +382,9 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     p.crates.forEach(crate => {
        updateEntityPhysics(crate);
        updateEntityCollisions(crate, false);
-       crate.vel.x *= CRATE_FRICTION; 
+       // Apply different friction based on type
+       const friction = crate.type === 'bomb' ? BOMB_FRICTION : WOOD_FRICTION;
+       crate.vel.x *= friction; 
     });
 
     // Handle Guide AND Companion <-> Crate interactions (Pushing)
@@ -308,7 +398,9 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
      const p = physicsRef.current;
      p.buttons.forEach(btn => {
         // Check if anything is pressing the button (Guide, Companion, or Crates)
+        const wasPressed = btn.isPressed;
         let pressed = false;
+        
         const checkPress = (ent: {pos: Vector2, width: number, height: number}) => {
            return (
               ent.pos.x < btn.x + btn.width &&
@@ -322,13 +414,214 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         p.crates.forEach(c => { if (checkPress(c)) pressed = true; });
 
         btn.isPressed = pressed;
+        
+        // Play button sound
+        if (!wasPressed && pressed) {
+            audioService.playButton();
+        }
 
         // Trigger Logic (Gates)
-        const gate = p.platforms.find(plat => plat.gateId === btn.triggerGateId);
-        if (gate) {
-           gate.isOpen = pressed;
+        if (btn.triggerGateId) {
+            const gate = p.platforms.find(plat => plat.gateId === btn.triggerGateId);
+            if (gate) {
+               gate.isOpen = pressed;
+            }
         }
      });
+  };
+
+  const updateSpawners = () => {
+      const p = physicsRef.current;
+      p.spawners.forEach(spawner => {
+          if (spawner.cooldown > 0) spawner.cooldown--;
+
+          // Check for trigger
+          const triggerBtn = p.buttons.find(b => b.triggerSpawnerId === spawner.id);
+          // Only spawn if button is pressed OR no trigger needed
+          if (!triggerBtn || triggerBtn.isPressed) {
+             if (spawner.cooldown <= 0) {
+                 // Check if we need to spawn
+                 // Limit to 1 active bomb per spawner to prevent physics chaos
+                 const existingBomb = p.crates.find(c => c.type === 'bomb' && Math.hypot(c.pos.x - spawner.x, c.pos.y - spawner.y) < 1000);
+                 
+                 if (!existingBomb) {
+                     const bomb: Crate = {
+                         id: Date.now(),
+                         type: 'bomb',
+                         pos: { x: spawner.x, y: spawner.y },
+                         vel: { x: 0, y: 0 },
+                         width: 40,
+                         height: 40,
+                         isGrounded: false
+                     };
+                     p.crates.push(bomb);
+                     spawner.cooldown = 200; // 3+ seconds cooldown
+                 }
+             }
+          }
+      });
+  };
+
+  const updateBoss = () => {
+      const p = physicsRef.current;
+      const boss = p.boss;
+      if (!boss) return;
+
+      // Update Invulnerability
+      if (boss.invulnerableTimer > 0) boss.invulnerableTimer--;
+
+      // Check Boss Death
+      if (boss.hp <= 0 && gameState === GameState.PLAYING) {
+           audioService.playWin();
+           p.boss = null;
+           onLevelComplete(p.bridgeCount);
+           return;
+      }
+
+      // Check Boss Phase
+      if (boss.phase === 1 && boss.hp <= 3) {
+          boss.phase = 2;
+          audioService.playBossHit(); 
+          // Reset attack state on phase change
+          boss.state = 'cooldown';
+          boss.attackTimer = 180; 
+      }
+
+      // Movement (Floating Sin wave)
+      boss.y += Math.sin(p.time * 0.1) * 0.5;
+
+      // STATE MACHINE
+      if (boss.state === 'cooldown') {
+          // RESTING
+          boss.attackTimer--;
+          if (boss.attackTimer <= 0) {
+              // Wake up
+              boss.state = 'attack';
+              boss.shotCount = 0; // Reset burst counter
+              boss.attackTimer = 0; // Ready to shoot immediately
+          }
+      } else if (boss.state === 'attack') {
+          // ATTACKING
+          boss.attackTimer--;
+
+          if (boss.attackTimer <= 0) {
+              const centerX = boss.x + boss.width/2;
+              const centerY = boss.y + boss.height/2;
+              
+              audioService.playBossShoot();
+
+              if (boss.phase === 1) {
+                  // PHASE 1: BURST FIRE (5 shots)
+                  const dx = (p.guide.pos.x + p.guide.width/2) - centerX;
+                  const dy = (p.guide.pos.y + p.guide.height/2) - centerY;
+                  const angle = Math.atan2(dy, dx);
+                  const speed = 5;
+                  
+                  p.projectiles.push({
+                      x: centerX, y: centerY,
+                      vx: Math.cos(angle) * speed,
+                      vy: Math.sin(angle) * speed,
+                      radius: 8, life: 300
+                  });
+                  
+                  boss.shotCount++;
+                  
+                  if (boss.shotCount >= 5) {
+                      // Burst complete, rest
+                      boss.state = 'cooldown';
+                      boss.attackTimer = 180; // 3 Seconds (60fps * 3)
+                  } else {
+                      // Next shot in burst
+                      // SLOWED DOWN from 12 to 60 (1 second per shot)
+                      boss.attackTimer = 60; 
+                  }
+
+              } else {
+                  // PHASE 2: AOE (Single big attack then rest)
+                  const rand = Math.random();
+                  
+                  if (rand > 0.5) {
+                       // Radial Burst
+                       for (let i = 0; i < 8; i++) {
+                          const angle = (Math.PI * 2 / 8) * i + p.time;
+                          const speed = 4;
+                          p.projectiles.push({
+                              x: centerX, y: centerY,
+                              vx: Math.cos(angle) * speed,
+                              vy: Math.sin(angle) * speed,
+                              radius: 8, life: 300
+                          });
+                      }
+                  } else {
+                      // Rain from sky
+                      for (let i = 0; i < 5; i++) {
+                          p.projectiles.push({
+                              x: p.guide.pos.x + (Math.random() * 400 - 200), // Around player
+                              y: -50 - (Math.random() * 200),
+                              vx: 0,
+                              vy: 5, // Fall down
+                              radius: 10, life: 300
+                          });
+                      }
+                  }
+                  
+                  // Phase 2 attacks are heavy, so always rest after one volley
+                  boss.state = 'cooldown';
+                  boss.attackTimer = 180; // 3 Seconds
+              }
+          }
+      }
+
+      // Bomb Collision with Boss
+      for (let i = p.crates.length - 1; i >= 0; i--) {
+          const c = p.crates[i];
+          if (c.type === 'bomb') {
+              const dx = (c.pos.x + c.width/2) - (boss.x + boss.width/2);
+              const dy = (c.pos.y + c.height/2) - (boss.y + boss.height/2);
+              const dist = Math.sqrt(dx*dx + dy*dy);
+              
+              if (dist < boss.width/2 + c.width/2) {
+                  // HIT
+                  if (boss.invulnerableTimer <= 0) {
+                      boss.hp--;
+                      boss.invulnerableTimer = 60; // 1 second iframe
+                      audioService.playBossHit();
+                  }
+                  // Destroy bomb
+                  p.crates.splice(i, 1);
+              }
+          }
+      }
+  };
+
+  const updateProjectiles = () => {
+      const p = physicsRef.current;
+      for (let i = p.projectiles.length - 1; i >= 0; i--) {
+          const proj = p.projectiles[i];
+          proj.x += proj.vx;
+          proj.y += proj.vy;
+          proj.life--;
+
+          if (proj.life <= 0) {
+              p.projectiles.splice(i, 1);
+              continue;
+          }
+
+          // Collision with Guide
+          const checkHit = (ent: Entity & {invulnerableTimer?: number}) => {
+             const dx = (ent.pos.x + ent.width/2) - proj.x;
+             const dy = (ent.pos.y + ent.height/2) - proj.y;
+             return Math.sqrt(dx*dx + dy*dy) < proj.radius + ent.width/2;
+          };
+
+          if (checkHit(p.guide)) {
+             takeDamage(p.guide);
+             p.projectiles.splice(i, 1); // Bullet destroyed
+             continue;
+          }
+          
+          // COMPANION IS IMMUNE TO PROJECTILES (Removed checkHit(p.companion))
+      }
   };
 
   const tick = () => {
@@ -343,6 +636,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
             if (p.isTethered) {
                 // Always allow disconnect
                 p.isTethered = false;
+                audioService.playTetherDisconnect();
             } else {
                 // Only allow reconnect if close enough
                 const dx = p.guide.pos.x - p.companion.pos.x;
@@ -350,6 +644,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
                 const dist = Math.sqrt(dx*dx + dy*dy);
                 if (dist < RECONNECT_DIST) {
                     p.isTethered = true;
+                    audioService.playTetherConnect();
                 }
             }
             toggleCooldown.current = true;
@@ -362,6 +657,9 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     updateMovingPlatforms();
     updateMonsters();
     updateButtons();
+    updateBoss();
+    updateSpawners();
+    updateProjectiles();
 
     // 2. Guide Input
     if (keys.current['KeyA'] || keys.current['ArrowLeft']) {
@@ -374,6 +672,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
     if ((keys.current['Space'] || keys.current['ArrowUp'] || keys.current['KeyW']) && p.guide.isGrounded) {
       p.guide.vel.y = JUMP_FORCE;
+      audioService.playJump();
     }
 
     // 3. Tether Logic
@@ -431,6 +730,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
                 setInkLeft(inkLeft - cost);
                 p.lastMousePos = { x: worldX, y: worldY };
                 p.bridgeCount++;
+                audioService.playDraw(); // Play scribble sound
             }
             }
         } else {
@@ -445,20 +745,33 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
     }
 
     // 6. Camera
-    // Camera focuses on midpoint, but biased towards guide if detached far away
-    let targetX = 0;
-    if (p.isTethered) {
-        const midX = (p.guide.pos.x + p.companion.pos.x) / 2;
-        targetX = midX;
+    if (currentLevel.autoScrollSpeed) {
+        // Auto Scroll Mode
+        p.cameraX += currentLevel.autoScrollSpeed;
+        
+        // Kill if fallen behind camera
+        const killThreshold = p.cameraX - 50;
+        if (p.guide.pos.x < killThreshold || p.companion.pos.x < killThreshold) {
+            audioService.playGameOver();
+            onGameOver();
+        }
     } else {
-        targetX = p.guide.pos.x;
+        // Standard Follow Mode
+        let targetX = 0;
+        if (p.isTethered) {
+            const midX = (p.guide.pos.x + p.companion.pos.x) / 2;
+            targetX = midX;
+        } else {
+            targetX = p.guide.pos.x;
+        }
+        
+        const targetCamX = targetX - window.innerWidth / 2;
+        p.cameraX += (targetCamX - p.cameraX) * 0.08;
     }
-    const targetCamX = targetX - window.innerWidth / 2;
-    p.cameraX += (targetCamX - p.cameraX) * 0.08;
 
-    // 7. Win Condition
+    // 7. Win Condition (Standard)
     const goal = p.platforms.find(pl => pl.type === 'goal');
-    if (goal) {
+    if (goal && !currentLevel.boss) { // Boss death handles level complete for boss levels
       const tolerance = 30;
       const isTouchingGoal = (entity: {pos: Vector2, width: number, height: number}) => {
         return (
@@ -470,6 +783,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       };
       // MUST BE TETHERED TO WIN
       if (p.isTethered && isTouchingGoal(p.companion) && isTouchingGoal(p.guide)) {
+        audioService.playWin();
         onLevelComplete(p.bridgeCount);
       }
     }
@@ -568,11 +882,20 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
       }
 
       // Goal Flag
-      if (plat.type === 'goal') {
+      if (plat.type === 'goal' && !currentLevel.boss) {
         const cx = plat.x + plat.width / 2;
         ctx.beginPath(); ctx.moveTo(cx, plat.y); ctx.lineTo(cx, plat.y - 80); ctx.stroke();
         ctx.fillStyle = '#fbbf24'; ctx.beginPath(); ctx.moveTo(cx, plat.y - 80); ctx.lineTo(cx + 60, plat.y - 60 + Math.sin(p.time*0.2)*5); ctx.lineTo(cx, plat.y - 40); ctx.fill();
       }
+    });
+
+    // Spawners (Visuals)
+    p.spawners.forEach(s => {
+        ctx.fillStyle = '#1e40af';
+        ctx.fillRect(s.x, s.y, 40, 10); // Spout
+        ctx.beginPath();
+        ctx.arc(s.x + 20, s.y, 10, 0, Math.PI, true);
+        ctx.fill();
     });
 
     // Buttons
@@ -582,20 +905,51 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
         const y = btn.y + (btn.height - h);
         ctx.fillRect(btn.x, y, btn.width, h);
         ctx.strokeRect(btn.x, y, btn.width, h);
+        
+        // Indicate "Safe Zone" buttons for Boss Levels
+        if (btn.triggerSpawnerId) {
+             ctx.strokeStyle = 'gold';
+             ctx.lineWidth = 3;
+             ctx.beginPath();
+             ctx.arc(btn.x + btn.width/2, y - 20, 15, 0, Math.PI*2);
+             ctx.stroke();
+             // Down arrow
+             ctx.beginPath(); ctx.moveTo(btn.x+btn.width/2, y-30); ctx.lineTo(btn.x+btn.width/2, y-10); ctx.stroke();
+        }
     });
 
     // Crates
     p.crates.forEach(c => {
-       ctx.fillStyle = '#d97706'; // Amber
-       ctx.fillRect(c.pos.x, c.pos.y, c.width, c.height);
-       // Wood texture details
-       ctx.strokeStyle = '#92400e';
-       ctx.lineWidth = 3;
-       ctx.strokeRect(c.pos.x, c.pos.y, c.width, c.height);
-       ctx.beginPath();
-       ctx.moveTo(c.pos.x, c.pos.y); ctx.lineTo(c.pos.x + c.width, c.pos.y + c.height);
-       ctx.moveTo(c.pos.x + c.width, c.pos.y); ctx.lineTo(c.pos.x, c.pos.y + c.height);
-       ctx.stroke();
+       if (c.type === 'bomb') {
+           // Bomb Visual
+           ctx.fillStyle = '#3b82f6'; // Blue
+           ctx.beginPath();
+           ctx.arc(c.pos.x + c.width/2, c.pos.y + c.height/2, c.width/2, 0, Math.PI*2);
+           ctx.fill();
+           // Glow
+           ctx.shadowBlur = 15;
+           ctx.shadowColor = '#60a5fa';
+           ctx.strokeStyle = 'white';
+           ctx.lineWidth = 2;
+           ctx.stroke();
+           ctx.shadowBlur = 0;
+           // Icon
+           ctx.fillStyle = 'white';
+           ctx.font = '20px sans-serif';
+           ctx.fillText('!', c.pos.x + 16, c.pos.y + 28);
+       } else {
+           // Wood Crate
+           ctx.fillStyle = '#d97706'; // Amber
+           ctx.fillRect(c.pos.x, c.pos.y, c.width, c.height);
+           // Wood texture details
+           ctx.strokeStyle = '#92400e';
+           ctx.lineWidth = 3;
+           ctx.strokeRect(c.pos.x, c.pos.y, c.width, c.height);
+           ctx.beginPath();
+           ctx.moveTo(c.pos.x, c.pos.y); ctx.lineTo(c.pos.x + c.width, c.pos.y + c.height);
+           ctx.moveTo(c.pos.x + c.width, c.pos.y); ctx.lineTo(c.pos.x, c.pos.y + c.height);
+           ctx.stroke();
+       }
     });
 
     // Monsters
@@ -619,6 +973,52 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
        const lookDir = m.vel.x > 0 ? 2 : -2;
        ctx.beginPath(); ctx.arc(cx - 8 + lookDir, bottom - 25, 2, 0, Math.PI*2); ctx.fill();
        ctx.beginPath(); ctx.arc(cx + 8 + lookDir, bottom - 25, 2, 0, Math.PI*2); ctx.fill();
+    });
+    
+    // Boss
+    if (p.boss) {
+        const b = p.boss;
+        const cx = b.x + b.width/2;
+        const cy = b.y + b.height/2;
+        
+        // Flash white if hit
+        if (b.invulnerableTimer > 0 && Math.floor(b.invulnerableTimer / 5) % 2 === 0) {
+            ctx.fillStyle = 'white';
+        } else {
+            ctx.fillStyle = b.phase === 1 ? '#4c1d95' : '#581c87'; // Deep Purple
+        }
+        
+        // Body
+        ctx.beginPath();
+        ctx.arc(cx, cy, b.width/2, 0, Math.PI*2);
+        ctx.fill();
+        
+        // Ring
+        ctx.strokeStyle = b.phase === 1 ? '#a78bfa' : '#ef4444'; // Purple -> Red
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.arc(cx, cy, b.width/2 + 5, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Eye state
+        const eyeColor = b.state === 'attack' ? '#ef4444' : (b.state === 'cooldown' ? '#94a3b8' : 'black');
+        
+        // Eye
+        ctx.fillStyle = 'black';
+        ctx.beginPath(); ctx.arc(cx, cy, 15, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = eyeColor;
+        ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI*2); ctx.fill();
+    }
+    
+    // Projectiles
+    p.projectiles.forEach(pr => {
+        ctx.fillStyle = '#ef4444';
+        ctx.beginPath();
+        ctx.arc(pr.x, pr.y, pr.radius, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = 'white';
+        ctx.lineWidth = 1;
+        ctx.stroke();
     });
 
     // Tether
@@ -649,12 +1049,27 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
     // Entities
     [p.guide, p.companion].forEach(ent => {
+        // Flash if invulnerable
+        if ((ent as any).invulnerableTimer > 0 && Math.floor(p.time * 10) % 2 === 0) {
+            ctx.globalAlpha = 0.5;
+        }
         ctx.fillStyle = ent.color;
         ctx.fillRect(ent.pos.x, ent.pos.y, ent.width, ent.height);
         ctx.fillStyle = 'white';
         ctx.beginPath(); ctx.arc(ent.pos.x + 10, ent.pos.y + 10, 4, 0, Math.PI*2); ctx.fill();
         ctx.beginPath(); ctx.arc(ent.pos.x + 24, ent.pos.y + 10, 4, 0, Math.PI*2); ctx.fill();
+        ctx.globalAlpha = 1.0;
     });
+
+    // Storm Effect (Scroll Levels)
+    if (currentLevel.autoScrollSpeed) {
+        // Draw a dark menacing gradient on the left side
+        const gradient = ctx.createLinearGradient(p.cameraX, 0, p.cameraX + 200, 0);
+        gradient.addColorStop(0, 'rgba(0,0,0,0.8)');
+        gradient.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(p.cameraX, 0, 200, height);
+    }
 
     ctx.restore();
   };
@@ -672,9 +1087,16 @@ const GameCanvas: React.FC<GameCanvasProps> = ({
 
   // Event Listeners (Same as before)
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => keys.current[e.code] = true;
+    const handleKeyDown = (e: KeyboardEvent) => {
+        keys.current[e.code] = true;
+        // Resume audio on interaction
+        audioService.resume(); 
+    };
     const handleKeyUp = (e: KeyboardEvent) => keys.current[e.code] = false;
-    const handleMouseDown = (e: PointerEvent) => mouse.current.isDown = true;
+    const handleMouseDown = (e: PointerEvent) => {
+        mouse.current.isDown = true;
+        audioService.resume(); 
+    };
     const handleMouseUp = () => { mouse.current.isDown = false; physicsRef.current.lastMousePos = null; };
     const handleMouseMove = (e: PointerEvent) => { mouse.current.x = e.clientX; mouse.current.y = e.clientY; };
 

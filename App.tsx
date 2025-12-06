@@ -103,7 +103,7 @@ const generateLevel = (levelIdx: number): LevelData => {
       ],
       crates: [
         // Crate to be pushed onto button
-        { id: 1, pos: { x: 200, y: groundY - 100 }, vel: { x: 0, y: 0 }, width: 50, height: 50, isGrounded: false }
+        { id: 1, type: 'wood', pos: { x: 200, y: groundY - 100 }, vel: { x: 0, y: 0 }, width: 50, height: 50, isGrounded: false }
       ],
       buttons: [
         // The button
@@ -168,13 +168,102 @@ const generateLevel = (levelIdx: number): LevelData => {
       ],
       crates: [
         // Crate on the high shelf
-        { id: 1, pos: { x: 100, y: groundY - 200 }, vel: { x: 0, y: 0 }, width: 50, height: 50, isGrounded: false }
+        { id: 1, type: 'wood', pos: { x: 100, y: groundY - 200 }, vel: { x: 0, y: 0 }, width: 50, height: 50, isGrounded: false }
       ],
       buttons: [
         // Button near the gate. Needs crate to stay pressed.
         { id: 1, triggerGateId: 99, x: 600, y: groundY, width: 80, height: 10, isPressed: false }
       ],
       monsters: []
+    },
+    // Level 7: The Chase (Auto Scroll)
+    {
+      id: 7,
+      name: "风暴将至 (The Escape)",
+      startPos: { x: 100, y: groundY - 100 },
+      companionPos: { x: 50, y: groundY - 100 },
+      inkLimit: 2000, // Lots of ink needed for speed
+      autoScrollSpeed: 1.2, // Chase speed
+      noInkZones: [
+          // Block cheese at the start
+          { x: 0, y: 0, width: 2000, height: groundY - 400 }
+      ],
+      platforms: [
+        // Long run
+        { x: 0, y: groundY, width: 500, height: 100, type: 'ground' },
+        // Gap 1
+        { x: 650, y: groundY - 50, width: 300, height: 100, type: 'ground' },
+        // Vertical wall obstacle - must bridge up fast
+        { x: 1050, y: groundY - 200, width: 50, height: 200, type: 'ground' },
+        { x: 1100, y: groundY - 200, width: 300, height: 20, type: 'ground' },
+        // Drop down
+        { x: 1500, y: groundY, width: 500, height: 100, type: 'ground' },
+        // Gate puzzle on the run!
+        { x: 2000, y: groundY - 250, width: 40, height: 350, type: 'gate', gateId: 77, isOpen: false },
+        { x: 2100, y: groundY, width: 400, height: 100, type: 'ground' },
+        
+        { x: 2300, y: groundY - 50, width: 150, height: 150, type: 'goal' },
+        { x: 0, y: groundY + 200, width: 4000, height: 100, type: 'hazard' }
+      ],
+      crates: [
+         // Crate needed to open gate quickly
+         { id: 1, type: 'wood', pos: { x: 1600, y: groundY - 100 }, vel: { x: 0, y: 0 }, width: 50, height: 50, isGrounded: false }
+      ],
+      buttons: [
+         { id: 1, triggerGateId: 77, x: 1800, y: groundY, width: 60, height: 10, isPressed: false }
+      ],
+      monsters: []
+    },
+    // Level 8: Boss Battle - The Core
+    {
+      id: 8,
+      name: "核心之战 (The Core)",
+      startPos: { x: 100, y: groundY - 100 },
+      companionPos: { x: 50, y: groundY - 100 },
+      inkLimit: 1200,
+      playerMaxHp: 15, // Increased HP to 15
+      platforms: [
+        // Starting safe zone platform
+        { x: 0, y: groundY, width: 300, height: 100, type: 'ground' },
+        // Safe Zone Roof (Protects Companion)
+        { x: 20, y: groundY - 120, width: 140, height: 20, type: 'ground' },
+        
+        // Boss arena platforms
+        { x: 400, y: groundY - 100, width: 200, height: 50, type: 'ground' },
+        { x: 700, y: groundY - 200, width: 200, height: 50, type: 'ground' },
+        { x: 400, y: groundY - 300, width: 200, height: 50, type: 'ground' },
+        // Walls to contain the fight
+        { x: -50, y: 0, width: 50, height: 2000, type: 'ground' },
+        { x: 1200, y: 0, width: 50, height: 2000, type: 'ground' },
+        // Ceiling
+        { x: 0, y: -400, width: 1200, height: 50, type: 'ground' },
+        { x: 0, y: groundY + 200, width: 2000, height: 100, type: 'hazard' }
+      ],
+      crates: [],
+      buttons: [
+          // Safe Zone Button. Requires companion to sit on it.
+          { id: 1, triggerSpawnerId: 1, x: 50, y: groundY, width: 80, height: 10, isPressed: false }
+      ],
+      monsters: [],
+      boss: {
+          x: 900, y: groundY - 400,
+          width: 80, height: 80,
+          hp: 6, maxHp: 6,
+          phase: 1,
+          attackTimer: 180, // Start with a pause (3s)
+          shotCount: 0,
+          invulnerableTimer: 0,
+          state: 'cooldown' // Start in cooldown to give player time
+      },
+      spawners: [
+          // Bomb dispenser above the arena
+          { id: 1, x: 500, y: groundY - 450, itemType: 'bomb', cooldown: 0 }
+      ],
+      noInkZones: [
+          // Prevent drawing directly on the boss or spawner to cheese physics
+          { x: 850, y: groundY - 450, width: 180, height: 180 },
+          { x: 450, y: groundY - 500, width: 150, height: 150 }
+      ]
     }
   ];
 
@@ -187,6 +276,7 @@ const App: React.FC = () => {
   const [currentLevel, setCurrentLevel] = useState<LevelData>(generateLevel(1));
   const [narrative, setNarrative] = useState("");
   const [inkLeft, setInkLeft] = useState(currentLevel.inkLimit);
+  const [playerHp, setPlayerHp] = useState(5);
 
   useEffect(() => {
     const handleResize = () => {
@@ -198,6 +288,7 @@ const App: React.FC = () => {
 
   useEffect(() => {
       setInkLeft(currentLevel.inkLimit);
+      setPlayerHp(currentLevel.playerMaxHp || 5);
   }, [currentLevel]);
 
   const handleReset = useCallback(() => {
@@ -205,6 +296,7 @@ const App: React.FC = () => {
     setTimeout(() => {
         setGameState(GameState.PLAYING);
         setInkLeft(currentLevel.inkLimit);
+        setPlayerHp(currentLevel.playerMaxHp || 5);
     }, 10);
   }, [currentLevel]);
 
@@ -237,6 +329,7 @@ const App: React.FC = () => {
         onGameOver={handleGameOver}
         inkLeft={inkLeft}
         setInkLeft={setInkLeft}
+        setPlayerHp={setPlayerHp}
       />
 
       <UIOverlay 
@@ -247,6 +340,8 @@ const App: React.FC = () => {
         onNextLevel={handleNextLevel}
         inkLeft={inkLeft}
         maxInk={currentLevel.inkLimit}
+        playerHp={playerHp}
+        playerMaxHp={currentLevel.playerMaxHp || 5}
       />
     </div>
   );
